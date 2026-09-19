@@ -148,10 +148,11 @@ class NotifyPolicy:
     def observe_checker_failure(self, source: str = "auto") -> list[dict]:
         self.checker_fail_rounds += 1
         out: list[dict] = []
-        if (self.checker_fail_rounds >= CHECKER_FAIL_ROUNDS_TO_NOTIFY
-                and not self.checker_notified):
-            self.checker_notified = True
+        if self.checker_fail_rounds >= CHECKER_FAIL_ROUNDS_TO_NOTIFY and not self.checker_notified:
+            # 手动检查可以累计故障观察，但只有自动检查真正产生提醒时才置位
+            # checker_notified——手动轮次不消耗下一次自动提醒机会。
             if source == "auto":
+                self.checker_notified = True
                 out.append({
                     "key": "__checker__", "type": "checker",
                     "title": "监测暂不可用",
@@ -159,7 +160,8 @@ class NotifyPolicy:
                     "why": "checker failed rounds>=2",
                 })
         if self.log:
-            self.log.info("checker fail round=%s notified=%s", self.checker_fail_rounds, self.checker_notified)
+            self.log.info("checker fail round=%s notified=%s source=%s",
+                          self.checker_fail_rounds, self.checker_notified, source)
         self._save()
         return out
 

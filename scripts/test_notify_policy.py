@@ -86,15 +86,24 @@ def main() -> int:
         item = n[0]
         return item["title"] == LINK_TITLES["proxy"] and item["title"] != "proxy"
 
-    def c5_检查器两轮失败提醒一次(p):
-        a = p.observe_checker_failure("auto")
-        b = p.observe_checker_failure("auto")
-        c = p.observe_checker_failure("auto")
-        p.observe_checker_success()
-        d = p.observe_checker_failure("auto")
-        e = p.observe_checker_failure("auto")
-        return len(a) == 0 and len(b) == 1 and len(c) == 0 and len(d) == 0 and len(e) == 1 \
-            and "监测" in b[0]["title"]
+    def c5_检查器通知_手动不消耗自动提醒(p):
+        # 反例（2.0.0）：manual → manual → auto，自动轮必须提醒一次；
+        # 之后不重复；恢复重置后再次失败，达到阈值自动轮再提醒；
+        # 手动轮永远静默；重启后状态一致（checker_notified 持久化）。
+        a = p.observe_checker_failure("manual")   # 轮1：静默
+        b = p.observe_checker_failure("manual")   # 轮2：手动 → 不提醒不置位
+        c = p.observe_checker_failure("auto")     # 自动轮 → 提醒一次并置位
+        d = p.observe_checker_failure("auto")     # 已通知 → 静默
+        p.observe_checker_success()               # 计数与置位重置
+        e = p.observe_checker_failure("manual")   # 轮1：手动 → 静默
+        f = p.observe_checker_failure("auto")     # 轮2：自动 → 提醒一次
+        g = p.observe_checker_failure("auto")     # 已通知 → 静默
+        ok = (len(a) == 0 and len(b) == 0 and len(c) == 1 and len(d) == 0
+              and len(e) == 0 and len(f) == 1 and len(g) == 0
+              and "监测" in c[0]["title"])
+        # 重启一致性：checker_notified / fail_rounds 来自状态文件
+        p2 = NotifyPolicy(state_path=p.state_path)
+        return ok and p2.checker_notified is True and p2.checker_fail_rounds >= 1
 
     def c6_故障类型变化是新事件(p):
         rounds(p, 2, base=T0)
@@ -146,7 +155,7 @@ def main() -> int:
     case("C2 持续故障：第2轮提醒一次后静默", c2_持续故障只提醒一次)
     case("C3 冷却时间戳持久化：重启后同链路冷却仍生效", c3_冷却时间戳持久化)
     case("C4 通知标题是显示名而非内部标识", c4_通知标题是显示名)
-    case("C5 检查器连续两轮失败：提醒一次并可在恢复后再提醒", c5_检查器两轮失败提醒一次)
+    case("C5 检查器通知：手动轮不消耗自动提醒，自动轮提醒一次且重启一致", c5_检查器通知_手动不消耗自动提醒)
     case("C6 故障类型变化：视为新事件再提醒", c6_故障类型变化是新事件)
     case("C7 重启不重复提醒；事件闭合后复发可再提醒", c7_重启不重复提醒_结束后复发可再提醒)
     case("C8 手动来源不弹通知但不消耗自动提醒", c8_手动来源不弹通知但不消耗自动提醒)

@@ -1,85 +1,149 @@
-"""代理地址精确解析：归属判断只用解析后的 (host, port)，禁止子串/前缀匹配。
+"""代理地址精确解析 v2：三态解析 + 严格归属。
 
-WinINET ProxyServer 有两种形态：
-  "127.0.0.1:8080"
-  "http=127.0.0.1:8080;https=127.0.0.1:8080;ftp=127.0.0.1:8080"
-环境变量（HTTP_PROXY 等）形如 "http://127.0.0.1:8080" 或 "127.0.0.1:8080"。
-历史教训：按 ":{port}" in v 或 startswith 判断归属会把 127.0.0.1:18080、
-"127.0.0.1:80806" 之类误判为受控。所有归属判断必须收敛到本模块。
-受控端点来自用户配置（cleanup.controlled_endpoint），本模块不内置任何端口。
+设计（2.0.0 审核修正）：
+- 解析三态：**empty**（真正空值）、**ok**（全部片段均为有效端点）、
+  **invalid**（非空字符串中存在任何无法解析的片段）。解析失败不再被当成空地址，
+  也就永远拿不到清理权限。
+- 主机规范化仅限：大小写、去方括号。**不合并** localhost 与 127.0.0.1、
+  不合并 IPv4 与 IPv6、不合并同一地址的不同书写形式——混合书写按不同主机处理，
+  取不到清理权限（安全侧）。
+- 「状态展示引用受控端点」与「修改权限」分开判断：references 只要求解析出
+  受控端点（供展示）；points（清理权限）要求全部端点都是受控端点，且混合
+  指向一律拒绝。
+- 受控端点来自用户配置；配置本身无法解析时一律拒绝修改（安全侧）。
+- 内部探针统一接收 (host, port)，由调用方注入；本模块不做网络 IO。
 """
 from __future__ import annotations
 
+import re
+from dataclasses import dataclass
 from urllib.parse import urlparse
 
-_LOOPBACK = {"127.0.0.1", "localhost", "::1"}
+EMPTY = "empty"
+OK = "ok"
+INVALID = "invalid"
 
 
-def parse_wininet_server(server: str) -> set[tuple[str, int]]:
-    """解析 WinINET ProxyServer 为 (host, port) 集合；无法解析的片段丢弃。"""
-    out: set[tuple[str, int]] = set()
-    for part in str(server or "").split(";"):
+@dataclass(frozen=True)
+class ParseResult:
+    kind: str  # "empty" | "ok" | "invalid"
+    endpoints: frozenset[tuple[str, int]]
+
+
+def _norm_host(host: str) -> str:
+    """仅规范化大小写与方括号；不做本机/远端/IPv4/IPv6 合并。"""
+    return host.strip("[]").lower()
+
+
+def parse_wininet_server(server: str | None) -> ParseResult:
+    """解析 WinINET ProxyServer。
+
+    形态："127.0.0.1:8080" 或 "http=127.0.0.1:8080;https=127.0.0.1:8080"。
+    真正空值 → empty；任何片段无法解析 → invalid（整串失效）。
+    """
+    text = "" if server is None else str(server)
+    if not text.strip():
+        return ParseResult(EMPTY, frozenset())
+    endpoints: set[tuple[str, int]] = set()
+    for part in text.split(";"):
         part = part.strip()
-        if not part:
-            continue
         if "=" in part:
             part = part.rsplit("=", 1)[1].strip()
         host, _, port = part.rpartition(":")
-        host = host.strip("[]").lower()
-        if host and port.isdigit() and int(port) <= 65535:
-            out.add((host, int(port)))
-    return out
+        host = _norm_host(host)
+        if not host or not port.isdigit() or int(port) > 65535:
+            return ParseResult(INVALID, frozenset())
+        endpoints.add((host, int(port)))
+    if not endpoints:
+        return ParseResult(INVALID, frozenset())
+    return ParseResult(OK, frozenset(endpoints))
 
 
-def parse_env_proxy(value: str) -> set[tuple[str, int]]:
-    """解析环境变量代理值（空格/分号分隔多项均可）。"""
-    out: set[tuple[str, int]] = set()
-    for part in str(value or "").replace(" ", ";").split(";"):
+def parse_env_proxy(value: str | None) -> ParseResult:
+    """解析环境变量代理值（"http://host:port" 或空格/分号分隔多项）。"""
+    text = "" if value is None else str(value)
+    if not text.strip():
+        return ParseResult(EMPTY, frozenset())
+    endpoints: set[tuple[str, int]] = set()
+    for part in text.replace(" ", ";").split(";"):
         part = part.strip()
         if not part:
-            continue
+            return ParseResult(INVALID, frozenset())
         if "://" not in part:
             part = "http://" + part
         try:
             u = urlparse(part)
             port = u.port  # 超范围端口（如 180800）此处抛 ValueError
-            if u.hostname and port:
-                out.add((u.hostname.strip("[]").lower(), port))
+            host = _norm_host(u.hostname or "")
+            if not host or not port:
+                return ParseResult(INVALID, frozenset())
         except ValueError:
-            continue
-    return out
+            return ParseResult(INVALID, frozenset())
+        endpoints.add((host, port))
+    return ParseResult(OK, frozenset(endpoints))
 
 
-def _parse_endpoint(endpoint: str) -> tuple[str, int]:
-    host, _, port = str(endpoint or "").strip().rpartition(":")
-    host = host.strip("[]").lower() or "127.0.0.1"
-    return host, int(port) if port.isdigit() else 0
+def parse_endpoint(endpoint: str | None) -> tuple[str, int] | None:
+    """解析受控端点配置（"host:port"）；无效返回 None（调用方必须拒绝修改）。"""
+    text = "" if endpoint is None else str(endpoint)
+    host, _, port = text.strip().rpartition(":")
+    host = _norm_host(host)
+    if not host or not port.isdigit() or int(port) > 65535:
+        return None
+    return host, int(port)
 
 
-def _is_ours(eps: set[tuple[str, int]], endpoint: str) -> bool:
-    """空集合（代理开启但无地址等退化态）视为受控可清理；
-    非空时要求全部端点都指向受控端点——混合指向其他代理一律不算受控。"""
-    if not eps:
+def wininet_points_at_controlled(server: str | None, endpoint: str | None) -> bool:
+    """清理权限：真空地址（空地址残留）或全部端点恰为受控端点时为 True；
+    解析失败、混合指向、受控端点配置无效一律 False。"""
+    ep = parse_endpoint(endpoint)
+    if ep is None:
+        return False
+    r = parse_wininet_server(server)
+    if r.kind == EMPTY:
         return True
-    host, port = _parse_endpoint(endpoint)
-    ours = {(h, port) for h in (_LOOPBACK | {host})}
-    return eps <= ours
+    if r.kind != OK:
+        return False
+    return r.endpoints == frozenset({ep})
 
 
-def wininet_points_at_controlled(server: str, endpoint: str) -> bool:
-    """WinINET ProxyServer 是否（仅）指向受控端点——清理权限判定（空=退化态可清）。"""
-    return _is_ours(parse_wininet_server(server), endpoint)
+def wininet_references_controlled(server: str | None, endpoint: str | None) -> bool:
+    """状态展示：地址解析出受控端点即算引用（混合指向也算引用）；empty/invalid 为 False。"""
+    ep = parse_endpoint(endpoint)
+    if ep is None:
+        return False
+    r = parse_wininet_server(server)
+    if r.kind != OK:
+        return False
+    return ep in r.endpoints
 
 
-def wininet_references_controlled(server: str, endpoint: str) -> bool:
-    """WinINET ProxyServer 是否引用了受控端点——状态展示判定（严格：空串不算）。"""
-    eps = parse_wininet_server(server)
-    host, port = _parse_endpoint(endpoint)
-    return any(h in (_LOOPBACK | {host}) and p == port for h, p in eps)
+def env_points_at_controlled(value: str | None, endpoint: str | None) -> bool:
+    """环境变量清理权限：值非空且全部端点均为受控端点。"""
+    ep = parse_endpoint(endpoint)
+    if ep is None:
+        return False
+    r = parse_env_proxy(value)
+    if r.kind != OK:
+        return False
+    return r.endpoints == frozenset({ep})
 
 
-def env_references_controlled(value: str, endpoint: str) -> bool:
-    """环境变量代理是否指向受控端点（任一端点命中即视为引用了死代理）。"""
-    eps = parse_env_proxy(value)
-    host, port = _parse_endpoint(endpoint)
-    return any(h in (_LOOPBACK | {host}) and p == port for h, p in eps)
+def env_references_controlled(value: str | None, endpoint: str | None) -> bool:
+    """环境变量展示判定：任一端点命中受控端点。"""
+    ep = parse_endpoint(endpoint)
+    if ep is None:
+        return False
+    r = parse_env_proxy(value)
+    if r.kind != OK:
+        return False
+    return ep in r.endpoints
+
+
+def probe_endpoints(server: str | None, probe) -> bool:
+    """对地址中的全部端点逐一执行注入探针 probe(host, port)；全部通过才为 True。
+    empty/invalid 返回 False。探针由调用方注入（测试不得触网）。"""
+    r = parse_wininet_server(server)
+    if r.kind != OK or not r.endpoints:
+        return False
+    return all(probe(host, port) for host, port in sorted(r.endpoints))

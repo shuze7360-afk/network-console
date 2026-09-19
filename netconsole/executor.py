@@ -4,11 +4,13 @@
   一律返回 manual-required；仅界面点击事件显式传 source="ui"。启动、定时检查、
   快照刷新与通知点击不代用户修改网络——只诊断、提醒与解释。
 - 跨进程命名互斥 + 进程内 RLock 串行；占用返回明确的 busy 结果并审计。
-- 写前读旧值、写后回读；状态文件损坏（state-unconfirmed）禁止启停写入。
-- 代理归属判断只经 proxyaddr 精确解析（host, port）；禁止子串/前缀匹配；
-  其他代理一律不动。
+- 写前读旧值、写后回读；**清理/恢复的成功以回读结果为准**（写入未生效返回
+  verify-failed，不谎报成功）。状态文件损坏（state-unconfirmed）禁止启停写入。
+- 代理归属判断只经 proxyaddr 三态精确解析（empty/ok/invalid）；解析失败与
+  混合指向一律不取得清理权限；其他代理一律不动。
+- 内部探针统一接收 (host, port) 并可注入，支持非本机端点。
 - 操作代际：关闭/停用请求使在途启停操作在检查点自行失效。
-- 仅作用于用户在配置中明确指定的程序与端口；未配置一律拒绝。
+- 仅作用于用户在配置中明确指定的程序与端口；未配置或配置无效一律拒绝。
 """
 from __future__ import annotations
 
@@ -68,7 +70,8 @@ def _write_wininet(name: str, vtype: str, value: str) -> None:
           "/v", name, "/t", vtype, "/d", value, "/f"])
 
 
-def tcp_up(port: int, host: str = "127.0.0.1", timeout: float = 0.9) -> bool:
+def tcp_up(host: str, port: int, timeout: float = 0.9) -> bool:
+    """内部统一探针：接收 (host, port)；测试可整体注入替换。"""
     import socket
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -171,36 +174,55 @@ class Executor:
 
     # ---- 通用动作 ----
     def cleanup_stale_proxy(self, port_probe=None, source: str = "background") -> OperationResult:
-        """清理指向受控端点的死代理残留；其他地址的代理一律不动（仅界面触发）。"""
+        """清理指向受控端点的死代理残留；仅界面触发。
+
+        归属（proxyaddr 三态）：真空地址=可清理的空地址残留；全部端点恰为
+        受控端点=可清理；解析失败或混合指向=非受控，不修改。
+        成功以回读为准：开关确实关闭才返回 cleaned，写入未生效返回 verify-failed。
+        """
         clean = appconfig.cleanup_settings()
         controlled = str(clean.get("controlled_endpoint", "127.0.0.1:8080"))
-        port = int(controlled.rpartition(":")[2] or 0)
+        ep = proxyaddr.parse_endpoint(controlled)
         payload = {"controlled": controlled, "source": source}
         gate = self._require_ui("cleanup_stale_proxy", payload, source)
         if gate:
             return gate
+        if ep is None:
+            return self._simple("cleanup_stale_proxy", payload, False, "invalid-config",
+                                f"受控端点配置无法解析：{controlled!r}；未修改任何设置")
+        chost, cport = ep
         try:
             with self._op_slot():
                 before = read_wininet()
                 probe = port_probe or tcp_up
-                port_up = probe(port) if port else False
+                port_up = probe(chost, cport) if cport else False
                 changes: list[str] = []
                 notes: list[str] = []
                 server = str(before.get("ProxyServer", "") or "")
+                parse = proxyaddr.parse_wininet_server(server)
                 ours = proxyaddr.wininet_points_at_controlled(server, controlled)
                 if before.get("ProxyEnable") and not port_up:
                     if ours:
                         _write_wininet("ProxyEnable", "REG_DWORD", "0")
                         changes.append(f"ProxyEnable 1->0（受控代理 {controlled} 未监听）")
+                    elif parse.kind == proxyaddr.INVALID:
+                        notes.append(f"系统代理地址无法解析（{server!r}），按非受控处理，未修改")
                     else:
                         notes.append(f"系统代理指向非受控地址 {server!r}，未修改")
                 elif before.get("ProxyEnable") and server and not ours:
                     notes.append(f"系统代理指向其他存活代理 {server!r}，不归一化、不修改")
                 after = read_wininet()
+                if changes:
+                    # 成功以回读为准：写入被忽略/覆盖（开关仍开启）→ verify-failed
+                    ok = after.get("ProxyEnable") == 0
+                    decision = "cleaned" if ok else "verify-failed"
+                    reason = "" if ok else "写入未生效：回读显示系统代理开关仍开启"
+                else:
+                    ok = True
+                    decision = "noop"
+                    reason = "；".join(notes) if notes else "系统代理状态健康"
                 result = OperationResult(
-                    self._new_id(), "cleanup_stale_proxy", True,
-                    "cleaned" if changes else "noop",
-                    "" if changes else ("；".join(notes) if notes else "系统代理状态健康"),
+                    self._new_id(), "cleanup_stale_proxy", ok, decision, reason,
                     {"before": before, "after": after, "port_up": port_up,
                      "changes": changes, "notes": notes})
                 self._audit("cleanup_stale_proxy", payload, result)
@@ -265,6 +287,12 @@ class Executor:
             return None
 
     def restore_snapshot(self, port_probe=None, source: str = "background") -> OperationResult:
+        """恢复最近健康快照；仅界面触发。
+
+        可信闸门：快照格式或地址解析不完整（invalid）→ 拒绝；启用代理的快照，
+        其**全部**将恢复端点必须逐一通过注入探针（any 不可用），否则拒绝
+        （unsafe-snapshot，零写入）。恢复成功以三字段回读为准（含 ProxyEnable）。
+        """
         payload = {"source": source}
         gate = self._require_ui("restore_snapshot", payload, source)
         if gate:
@@ -275,28 +303,27 @@ class Executor:
                                 "代理功能未启用：恢复快照会写入代理设置，已跳过")
         snap = self.read_snapshot()
         if snap is None:
-            # 文件缺失与内容损坏都不可作为恢复依据
             snap_file = appconfig.data_dir() / "wininet-last-good.json"
             decision = "invalid-snapshot" if snap_file.exists() else "no-snapshot"
             return self._simple("restore_snapshot", payload, False, decision,
                                 "快照文件损坏，已拒绝恢复" if decision == "invalid-snapshot"
                                 else "尚无健康快照")
+        snap_enable = int(snap.get("ProxyEnable", 0) or 0)
+        snap_server = str(snap.get("ProxyServer", "") or "")
+        parse = proxyaddr.parse_wininet_server(snap_server)
+        if snap_enable == 1 and (parse.kind != proxyaddr.OK or not parse.endpoints):
+            return self._simple("restore_snapshot", payload, False, "unsafe-snapshot",
+                                f"快照代理地址不完整或无法解析（{snap_server!r}）；"
+                                "恢复会产生不可确认的设置，已拒绝",
+                                {"snapshot": snap})
+        probe = port_probe or tcp_up
+        if snap_enable == 1 and not all(probe(host, port) for host, port in sorted(parse.endpoints)):
+            return self._simple("restore_snapshot", payload, False, "unsafe-snapshot",
+                                f"快照代理目标 {snap_server!r} 并非全部可达；"
+                                "恢复会产生死代理，已拒绝。",
+                                {"snapshot": snap})
         try:
             with self._op_slot():
-                # 可用性闸门：快照启用了代理但其目标当前不可达 → 恢复=制造死代理，拒绝。
-                snap_enable = int(snap.get("ProxyEnable", 0) or 0)
-                snap_server = str(snap.get("ProxyServer", "") or "")
-                if snap_enable == 1:
-                    eps = proxyaddr.parse_wininet_server(snap_server)
-                    alive = any(tcp_up(port, host="127.0.0.1" if host in ("localhost", "::1") else host)
-                                for host, port in eps)
-                    if not alive:
-                        result = OperationResult(
-                            self._new_id(), "restore_snapshot", False, "unsafe-snapshot",
-                            f"快照代理目标 {snap_server!r} 当前不可达；恢复会产生死代理，已拒绝。",
-                            {"snapshot": snap})
-                        self._audit("restore_snapshot", payload, result)
-                        return result
                 before = read_wininet()
                 for name, vtype, value in (
                     ("ProxyEnable", "REG_DWORD", str(snap_enable)),
@@ -359,15 +386,16 @@ class Executor:
 
                 prog = fcfg.get("program", {}) or {}
                 exe = str(prog.get("path", "") or "")
-                port_s = str(fcfg.get("endpoint", "")).rpartition(":")[2]
-                port = int(port_s) if port_s.isdigit() else 0
+                ep = proxyaddr.parse_endpoint(str(fcfg.get("endpoint", "")))
+                port = ep[1] if ep else 0
+                fhost = ep[0] if ep else "127.0.0.1"
                 probe = port_probe or tcp_up
 
                 if not on:
                     feature_state_off = appconfig.set_feature_enabled(name, False)
                     targets = self._program_targets(exe)
                     stopped = self._kill_verified(targets)
-                    port_down = self._wait_port(port, False, 15, probe)
+                    port_down = (not port) or self._wait_port(fhost, port, False, 15, probe)
                     if not port_down:
                         return OperationResult(
                             self._new_id(), "feature_toggle", False, "incomplete",
@@ -389,7 +417,7 @@ class Executor:
                                              {})
                     self._audit("feature_toggle", payload, result)
                     return result
-                if probe(port) if port else False:
+                if port and probe(fhost, port):
                     appconfig.set_feature_enabled(name, True)
                     fwd = (forward_probe or self._forward)(fcfg, port) if port else {"ok": True}
                     ok = fwd.get("ok") is True
@@ -416,10 +444,10 @@ class Executor:
                         return OperationResult(self._new_id(), "feature_toggle", False,
                                                "cancelled", "等待期间出现停用请求，已取消",
                                                {"stage": "port-wait"})
-                    if probe(port):
+                    if not port or probe(fhost, port):
                         break
                     time.sleep(0.6)
-                if not probe(port):
+                if port and not probe(fhost, port):
                     result = OperationResult(self._new_id(), "feature_toggle", False,
                                              "failed", "程序已启动但端口未在预期时间内就绪",
                                              {"stage": "port-wait"})
@@ -502,14 +530,14 @@ class Executor:
             out[str(pid)] = r.strip()[:120] or "killed"
         return out
 
-    def _wait_port(self, port: int, up: bool, timeout: float, probe=None) -> bool:
+    def _wait_port(self, host: str, port: int, up: bool, timeout: float, probe=None) -> bool:
         probe = probe or tcp_up
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            if probe(port) == up:
+            if probe(host, port) == up:
                 return True
             time.sleep(0.6)
-        return probe(port) == up
+        return probe(host, port) == up
 
     def _forward(self, fcfg: dict, port: int) -> dict:
         probe_url = fcfg.get("probe_url") or "http://www.msftconnecttest.com/connecttest.txt"
@@ -527,14 +555,18 @@ class Executor:
             json.dumps(before, ensure_ascii=False, indent=1), encoding="utf-8")
         evidence = {"wininet_before": before}
         server = str(before.get("ProxyServer", "") or "")
-        if proxyaddr.wininet_points_at_controlled(server, controlled) and before.get("ProxyEnable"):
+        if (before.get("ProxyEnable")
+                and proxyaddr.wininet_points_at_controlled(server, controlled)):
             _write_wininet("ProxyEnable", "REG_DWORD", "0")
+        elif server:
+            evidence["other_proxy_left"] = server
         env_out = {}
         for n in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
             v = _run(["powershell", "-NoProfile", "-Command",
                       f"[string][Environment]::GetEnvironmentVariable('{n}','User')"]).strip()
             env_out[n] = v
-            if v and proxyaddr.env_references_controlled(v, controlled):
+            # 混合指向（含非受控条目）的环境变量整体保留，避免误删其他项目配置
+            if v and proxyaddr.env_points_at_controlled(v, controlled):
                 _run(["powershell", "-NoProfile", "-Command",
                       f"[Environment]::SetEnvironmentVariable('{n}', $null, 'User')"])
         evidence["env_before"] = env_out
