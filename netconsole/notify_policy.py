@@ -1,12 +1,14 @@
-"""通知策略：决定哪些观察需要提醒用户（纯逻辑，可离线模拟测试）。
+"""通知策略：决定哪些观察需要提醒用户（纯逻辑，可离线测试，时间可注入）。
 
-规则（可靠性优化后）：
+规则（2.0.0）：
 - 故障第 1 轮只记录；同一链路同一故障类型持续到第 2 轮才提醒一次，之后不重复。
-- **「已通知」只在真正发送后置位**——手动检查只计数，不消耗自动提醒机会。
-- 恢复永远安静；连续 2 轮「正常」才闭合事件；「未验证」不算恢复（不计数）；
-  「主动关闭 / 不适用」立即清除事件（功能关了，待提醒随之作废）。
-- 自动修复按结构化事件记录尝试次数：同一事件只自动尝试一次，失败后停止自动写入，
-  提醒用户；事件闭合或用户手动重试（reset_autofix）后才允许再次自动尝试。
+- 「已通知」只在真正发送后置位——手动检查只计数，不消耗自动提醒机会。
+- 恢复永远安静；连续 2 轮「正常」闭合事件；「未验证」不计数；
+  「主动关闭 / 不适用 / 外部已启动」立即作废事件。
+- 同一链路两条提醒至少间隔 MIN_NOTIFY_INTERVAL（防故障抖动刷屏）；
+  冷却时间戳持久化（重启后冷却仍有效）。
+- **无自动修复**（2.0.0 起）：控制台只发现问题、提示操作；网络修改只能由
+  用户在界面触发。原 autofix API 已随需求变更移除。
 - 事件状态原子持久化：重启不重复提醒未解决旧事件。
 """
 from __future__ import annotations
@@ -26,6 +28,23 @@ MIN_NOTIFY_INTERVAL = 900  # 同一链路两条提醒的最小间隔（15 分钟
 CHECKER_FAIL_ROUNDS_TO_NOTIFY = 2
 
 
+def classify_failure(reason: str) -> str:
+    """无结构化 kind 时从结论文本推断类型（与 present.EXPLANATIONS 同一词汇）。"""
+    r = reason or ""
+    if "残留" in r:
+        return "stale_residue"
+    if "认证" in r or "hosts" in r:
+        return "auth"
+    if "转发" in r or "节点" in r or "EOF" in r or "劫持" in r:
+        return "forward"
+    if "服务" in r or "健康" in r:
+        return "service_health"
+    if "DNS" in r:
+        return "dns"
+    if "直连" in r:
+        return "basic_direct"
+    return "generic"
+
 
 def _atomic_write(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -42,11 +61,9 @@ class NotifyPolicy:
             appconfig.data_dir() / "notify-state.json")
         self.log = logger
         self.events: dict[str, dict] = {}
-        self.pending_autofix: dict[str, dict] = {}
-        self.autofix_attempts: dict[str, int] = {}
         self.checker_fail_rounds = 0
         self.checker_notified = False
-        self.last_notified_at: dict = {}
+        self.last_notified_at: dict[str, float] = {}
         self._load()
 
     def _load(self) -> None:
@@ -55,8 +72,6 @@ class NotifyPolicy:
         try:
             data = json.loads(self.state_path.read_text(encoding="utf-8"))
             self.events = data.get("events", {})
-            self.pending_autofix = data.get("pending_autofix", {})
-            self.autofix_attempts = data.get("autofix_attempts", {})
             self.last_notified_at = data.get("last_notified_at", {})
             self.checker_fail_rounds = data.get("checker_fail_rounds", 0)
             self.checker_notified = data.get("checker_notified", False)
@@ -67,30 +82,12 @@ class NotifyPolicy:
         try:
             _atomic_write(self.state_path, json.dumps({
                 "events": self.events,
-                "pending_autofix": self.pending_autofix,
-                "autofix_attempts": self.autofix_attempts,
                 "last_notified_at": self.last_notified_at,
                 "checker_fail_rounds": self.checker_fail_rounds,
                 "checker_notified": self.checker_notified,
             }, ensure_ascii=False, indent=1))
         except Exception:
             pass
-
-    # ---- 自动修复：每事件一次自动尝试 ----
-    def allow_autofix(self, link: str) -> bool:
-        return self.autofix_attempts.get(link, 0) == 0
-
-    def reset_autofix(self, link: str) -> None:
-        self.autofix_attempts.pop(link, None)
-        self._save()
-
-    def note_autofix(self, link: str, ok: bool, decision: str, reason: str = "") -> None:
-        self.autofix_attempts[link] = self.autofix_attempts.get(link, 0) + 1
-        self.pending_autofix[link] = {"ok": bool(ok), "decision": decision, "reason": reason}
-        if self.log:
-            self.log.info("autofix link=%s ok=%s decision=%s attempt=%s",
-                          link, ok, decision, self.autofix_attempts[link])
-        self._save()
 
     # ---- 每轮检查观察 ----
     def observe(self, links: dict, source: str = "auto", now: float | None = None) -> list[dict]:
@@ -103,8 +100,7 @@ class NotifyPolicy:
             title_key = link
             status = r.get("status")
             if status == "故障":
-                # 公开版：类型完全由结构化 kind 决定，不做中文文案解析
-                ftype = str(r.get("kind") or "generic")
+                ftype = str(r.get("kind") or "") or classify_failure(str(r.get("reason", "")))
                 ev = self.events.get(title_key)
                 if not ev or ev.get("type") != ftype:
                     ev = {"type": ftype, "rounds": 0, "notified": False,
@@ -114,12 +110,8 @@ class NotifyPolicy:
                 ev["reason"] = str(r.get("reason", ""))
                 self.events[title_key] = ev
 
-                pending = self.pending_autofix.pop(title_key, None)
                 should, why = False, ""
-                if pending is not None:
-                    should = True
-                    why = f"自动修复（{pending.get('decision')}）后复查仍故障"
-                elif ev["rounds"] >= FAIL_ROUNDS_TO_NOTIFY and not ev.get("notified"):
+                if ev["rounds"] >= FAIL_ROUNDS_TO_NOTIFY and not ev.get("notified"):
                     should = True
                     why = f"故障已持续 {ev['rounds']} 轮"
                 cooled = now - self.last_notified_at.get(title_key, 0) >= MIN_NOTIFY_INTERVAL
@@ -136,21 +128,18 @@ class NotifyPolicy:
                         self.log.info("observe %s fail type=%s round=%s should=%s why=%s source=%s",
                                       link, ftype, ev["rounds"], should, why, source)
             else:
-                self.pending_autofix.pop(title_key, None)
                 ev = self.events.get(title_key)
                 if status in ("主动关闭", "不适用", "外部已启动"):
-                    # 功能关闭/不适用：待提醒事件立即作废（自动尝试计数一并复位）
+                    # 功能关闭/不适用/外部启动：如实展示而非故障，待提醒事件立即作废
                     if title_key in self.events and self.log:
                         self.log.info("event discard %s (status=%s)", link, status)
                     self.events.pop(title_key, None)
-                    self.autofix_attempts.pop(title_key, None)
                 elif status == "正常" and ev:
                     ev["recover_rounds"] = int(ev.get("recover_rounds", 0)) + 1
                     if ev["recover_rounds"] >= RECOVER_ROUNDS_TO_CLOSE:
                         if self.log:
                             self.log.info("event close %s (recovered)", link)
                         self.events.pop(title_key, None)
-                        self.autofix_attempts.pop(title_key, None)
                 # 未验证/其他中间态：不算恢复，也不计失败
         self._save()
         return out

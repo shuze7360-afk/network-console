@@ -1,7 +1,12 @@
-"""统一执行器（公开版）：所有修改的唯一入口。
+"""统一执行器（公开版 2.0.0）：所有修改的唯一入口。
 
+- **来源校验（2.0.0 起，最外层闸门）**：所有修改类动作默认 source="background"，
+  一律返回 manual-required；仅界面点击事件显式传 source="ui"。启动、定时检查、
+  快照刷新与通知点击不代用户修改网络——只诊断、提醒与解释。
 - 跨进程命名互斥 + 进程内 RLock 串行；占用返回明确的 busy 结果并审计。
 - 写前读旧值、写后回读；状态文件损坏（state-unconfirmed）禁止启停写入。
+- 代理归属判断只经 proxyaddr 精确解析（host, port）；禁止子串/前缀匹配；
+  其他代理一律不动。
 - 操作代际：关闭/停用请求使在途启停操作在检查点自行失效。
 - 仅作用于用户在配置中明确指定的程序与端口；未配置一律拒绝。
 """
@@ -20,7 +25,7 @@ from ctypes import wintypes
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-from . import appconfig
+from . import appconfig, proxyaddr
 from .diagnostics.base import CREATE_NO_WINDOW, http_get
 from .logutil import get_logger
 
@@ -155,13 +160,25 @@ class Executor:
         with (log_dir / "audit.jsonl").open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(record, ensure_ascii=False) + "\n")
 
+    def _require_ui(self, action: str, payload: dict, source: str) -> OperationResult | None:
+        """来源闸门（最外层）：来源检查先于配置、意图、进程或网络设置写入。"""
+        if source != "ui":
+            return self._simple(
+                action, payload, False, "manual-required",
+                "后台会话不能修改网络；请在控制台界面操作（诊断与提醒不受影响）",
+                {"source": source})
+        return None
+
     # ---- 通用动作 ----
-    def cleanup_stale_proxy(self, port_probe=None) -> OperationResult:
-        """清理指向受控端点的死代理残留；其他地址的代理一律不动。"""
+    def cleanup_stale_proxy(self, port_probe=None, source: str = "background") -> OperationResult:
+        """清理指向受控端点的死代理残留；其他地址的代理一律不动（仅界面触发）。"""
         clean = appconfig.cleanup_settings()
         controlled = str(clean.get("controlled_endpoint", "127.0.0.1:8080"))
         port = int(controlled.rpartition(":")[2] or 0)
-        payload = {"controlled": controlled}
+        payload = {"controlled": controlled, "source": source}
+        gate = self._require_ui("cleanup_stale_proxy", payload, source)
+        if gate:
+            return gate
         try:
             with self._op_slot():
                 before = read_wininet()
@@ -170,7 +187,7 @@ class Executor:
                 changes: list[str] = []
                 notes: list[str] = []
                 server = str(before.get("ProxyServer", "") or "")
-                ours = server in ("", controlled) or server.startswith(f"127.0.0.1:{port}")
+                ours = proxyaddr.wininet_points_at_controlled(server, controlled)
                 if before.get("ProxyEnable") and not port_up:
                     if ours:
                         _write_wininet("ProxyEnable", "REG_DWORD", "0")
@@ -194,9 +211,12 @@ class Executor:
             self._audit("cleanup_stale_proxy", payload, result)
             return result
 
-    def restore_bypass(self) -> OperationResult:
-        """把配置的直连例外合并进 ProxyOverride（不覆盖用户已有条目）。"""
-        payload = {"action": "restore_bypass"}
+    def restore_bypass(self, source: str = "background") -> OperationResult:
+        """把配置的直连例外合并进 ProxyOverride（不覆盖用户已有条目；仅界面触发）。"""
+        payload = {"action": "restore_bypass", "source": source}
+        gate = self._require_ui("restore_bypass", payload, source)
+        if gate:
+            return gate
         defaults = list(appconfig.cleanup_settings().get("bypass_defaults", []))
         try:
             with self._op_slot():
@@ -215,7 +235,7 @@ class Executor:
                         "merged" if after.get("ProxyOverride") == merged else "verify-failed",
                         f"已合并写入 {len(missing)} 条直连例外",
                         {"added": missing, "after": after})
-                self._audit("restore_bypass", {}, result)
+                self._audit("restore_bypass", payload, result)
                 return result
         except Executor._Busy:
             result = OperationResult(self._new_id(), "restore_bypass", False, "busy",
@@ -239,32 +259,56 @@ class Executor:
         if not path.exists():
             return None
         try:
-            return json.loads(path.read_text(encoding="utf-8"))
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else None
         except Exception:
             return None
 
-    def restore_snapshot(self, port_probe=None) -> OperationResult:
-        payload = {}
+    def restore_snapshot(self, port_probe=None, source: str = "background") -> OperationResult:
+        payload = {"source": source}
+        gate = self._require_ui("restore_snapshot", payload, source)
+        if gate:
+            return gate
         cfg = appconfig.load_config()
         if cfg["features"]["proxy"].get("enabled") is False:
             return self._simple("restore_snapshot", payload, False, "feature-disabled",
                                 "代理功能未启用：恢复快照会写入代理设置，已跳过")
         snap = self.read_snapshot()
-        if not snap:
-            return self._simple("restore_snapshot", payload, False, "no-snapshot",
-                                "尚无健康快照")
+        if snap is None:
+            # 文件缺失与内容损坏都不可作为恢复依据
+            snap_file = appconfig.data_dir() / "wininet-last-good.json"
+            decision = "invalid-snapshot" if snap_file.exists() else "no-snapshot"
+            return self._simple("restore_snapshot", payload, False, decision,
+                                "快照文件损坏，已拒绝恢复" if decision == "invalid-snapshot"
+                                else "尚无健康快照")
         try:
             with self._op_slot():
+                # 可用性闸门：快照启用了代理但其目标当前不可达 → 恢复=制造死代理，拒绝。
+                snap_enable = int(snap.get("ProxyEnable", 0) or 0)
+                snap_server = str(snap.get("ProxyServer", "") or "")
+                if snap_enable == 1:
+                    eps = proxyaddr.parse_wininet_server(snap_server)
+                    alive = any(tcp_up(port, host="127.0.0.1" if host in ("localhost", "::1") else host)
+                                for host, port in eps)
+                    if not alive:
+                        result = OperationResult(
+                            self._new_id(), "restore_snapshot", False, "unsafe-snapshot",
+                            f"快照代理目标 {snap_server!r} 当前不可达；恢复会产生死代理，已拒绝。",
+                            {"snapshot": snap})
+                        self._audit("restore_snapshot", payload, result)
+                        return result
                 before = read_wininet()
                 for name, vtype, value in (
-                    ("ProxyEnable", "REG_DWORD", str(int(snap.get("ProxyEnable", 0)))),
-                    ("ProxyServer", "REG_SZ", snap.get("ProxyServer", "")),
-                    ("ProxyOverride", "REG_SZ", snap.get("ProxyOverride", "")),
+                    ("ProxyEnable", "REG_DWORD", str(snap_enable)),
+                    ("ProxyServer", "REG_SZ", snap_server),
+                    ("ProxyOverride", "REG_SZ", str(snap.get("ProxyOverride", "") or "")),
                 ):
                     _write_wininet(name, vtype, value)
                 after = read_wininet()
-                ok = (after.get("ProxyServer") == snap.get("ProxyServer")
-                      and after.get("ProxyOverride") == snap.get("ProxyOverride"))
+                # 回读必须包含 ProxyEnable，三字段一致才算恢复成功。
+                ok = (after.get("ProxyEnable") == snap_enable
+                      and after.get("ProxyServer") == snap_server
+                      and after.get("ProxyOverride") == (snap.get("ProxyOverride", "") or ""))
                 result = OperationResult(
                     self._new_id(), "restore_snapshot", ok,
                     "restored" if ok else "verify-failed",
@@ -278,15 +322,21 @@ class Executor:
             self._audit("restore_snapshot", payload, result)
             return result
 
-    # ---- 功能启停（仅作用于配置中明确指定的本地程序）----
-    def feature_enable(self, name: str, port_probe=None, forward_probe=None) -> OperationResult:
-        return self._feature_toggle(name, True, port_probe, forward_probe)
+    # ---- 功能启停（仅作用于配置中明确指定的本地程序；仅界面触发）----
+    def feature_enable(self, name: str, port_probe=None, forward_probe=None,
+                       source: str = "background") -> OperationResult:
+        return self._feature_toggle(name, True, port_probe, forward_probe, source)
 
-    def feature_disable(self, name: str, port_probe=None) -> OperationResult:
-        return self._feature_toggle(name, False, port_probe, None)
+    def feature_disable(self, name: str, port_probe=None,
+                        source: str = "background") -> OperationResult:
+        return self._feature_toggle(name, False, port_probe, None, source)
 
-    def _feature_toggle(self, name: str, on: bool, port_probe, forward_probe=None) -> OperationResult:
-        payload = {"feature": name, "on": on}
+    def _feature_toggle(self, name: str, on: bool, port_probe,
+                        forward_probe=None, source: str = "background") -> OperationResult:
+        payload = {"feature": name, "on": on, "source": source}
+        gate = self._require_ui("feature_toggle", payload, source)
+        if gate:
+            return gate
         if name not in appconfig.FEATURE_KEYS or name == "basic":
             return self._simple("feature_toggle", payload, False, "unknown-feature",
                                 f"未知功能 {name}")
@@ -348,7 +398,6 @@ class Executor:
                         "already-running" if ok else "already-running-unverified",
                         "程序已在运行" + ("，探针通过" if ok else "，探针未通过"),
                         {"forward": fwd})
-                import os as _os
 
                 try:
                     subprocess.Popen([exe] + list(prog.get("args", [])),
@@ -478,14 +527,14 @@ class Executor:
             json.dumps(before, ensure_ascii=False, indent=1), encoding="utf-8")
         evidence = {"wininet_before": before}
         server = str(before.get("ProxyServer", "") or "")
-        if before.get("ProxyEnable") and (server == controlled or server == ""):
+        if proxyaddr.wininet_points_at_controlled(server, controlled) and before.get("ProxyEnable"):
             _write_wininet("ProxyEnable", "REG_DWORD", "0")
         env_out = {}
         for n in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
             v = _run(["powershell", "-NoProfile", "-Command",
                       f"[string][Environment]::GetEnvironmentVariable('{n}','User')"]).strip()
             env_out[n] = v
-            if v and f":{port}" in v:
+            if v and proxyaddr.env_references_controlled(v, controlled):
                 _run(["powershell", "-NoProfile", "-Command",
                       f"[Environment]::SetEnvironmentVariable('{n}', $null, 'User')"])
         evidence["env_before"] = env_out

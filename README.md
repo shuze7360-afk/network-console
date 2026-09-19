@@ -5,9 +5,13 @@ Windows 桌面托盘应用：以四张状态卡（**基础网络 / 网络认证 
 的操作都由统一执行器完成（写前读旧值、写后回读、留审计日志），界面不直接改动
 任何设置。
 
+**2.0.0 行为边界**：后台与 AI 会话只诊断、提醒与解释；网络修改只能由用户在
+控制台界面点击触发。启动、定时检查、快照刷新与通知点击零网络写入；发现的
+问题通过托盘提醒一次（带冷却），由你点击对应按钮处理。
+
 - GUI：Python + PySide6，明暗主题跟随 Windows
 - 后台：3 分钟静默定时检查，仅在需要人工处理时提醒（故障抖动有冷却）
-- MCP：内置 stdio 服务器，可接入支持 MCP 的 AI 助手做只读诊断与受限修复
+- MCP：内置 stdio 服务器，可接入支持 MCP 的 AI 助手做只读诊断（2.0.0 起不再代为修复）
 - 平台：Windows 10/11（使用 WinINET/netsh/WMI 等系统能力）
 
 ## 安装
@@ -46,17 +50,50 @@ py -3.13 -m venv .venv
 仓库内的 `netconsole/mcp_server.py` 是 stdio MCP 服务器：
 
 - `net_status` —— 四链路状态、一句话摘要、待处理事项、系统代理摘要（只读）；
-- `net_fix` —— 受限修复：`cleanup_stale_proxy` / `restore_bypass` /
-  `restore_snapshot`（写前读旧值、写后回读、审计）。
+- `net_fix` —— **2.0.0 起不再代为执行修复**：合法 action
+  （`cleanup_stale_proxy` / `restore_bypass` / `restore_snapshot`）返回
+  `manual-required` 与界面操作指引，拒绝本身留审计；未知 action 返回参数错误。
 
-MCP 不提供会话内启动/停止服务的能力；功能被用户关闭时修复工具返回
-`feature-disabled` 而不是替用户做决定。
+MCP 不提供会话内启动/停止服务的能力。这是一个不兼容变化：依赖 v1
+「调用即修复」行为的集成需要改为把指引转述给用户。
+
+## 隐私扫描
+
+`scripts/privacy_scan.py` 在发布前扫描敏感信息（只输出位置+类别，不回显内容）：
+
+- 通用规则内置（凭据、邮箱、内网 IP、设备名、可疑赋值），扫描器自身也在
+  扫描范围内；扫描集为 git 语义的发布候选（跟踪 + 未忽略未跟踪文件）全量
+  覆盖，二进制按字节扫描，无法读取的对象列入待处理而非计为通过；
+- 与使用者真实身份相关的词表**保存在仓库外**：用 `--private-rules PATH` 或
+  环境变量 `NETWORK_CONSOLE_PRIVATE_RULES` 提供（JSON：`{"patterns": {"类别": "正则"}}`），
+  缺失时自动降级为仅通用规则，对公开贡献者足够；
+- `--history REPO` 对指定仓库做历史审计：逐提交扫描补丁内容、提交消息与
+  作者/提交者身份元数据。
 
 ## 隐私与边界
 
 - 默认不启动、停止或接管任何服务；探针仅访问你在配置中指定的地址。
 - 清理动作只处理明确指向受控端点的残留；指向其他地址的代理一律不动。
 - 日志/状态保存在本地数据目录；仓库不含任何真实网络配置或个人数据。
+
+## 测试
+
+```bat
+.venv\Scripts\python scripts\test_appconfig.py
+.venv\Scripts\python scripts\test_proxyaddr.py
+.venv\Scripts\python scripts\test_notify_policy.py
+.venv\Scripts\python scripts\test_present.py
+.venv\Scripts\python scripts\test_notify_cooldown.py
+.venv\Scripts\python scripts\test_source_boundary.py
+.venv\Scripts\python scripts\test_mcp_server.py
+.venv\Scripts\python scripts\verify_silent.py
+.venv\Scripts\python scripts\ui_screenshots.py
+.venv\Scripts\python scripts\privacy_scan.py
+```
+
+全部离线（临时数据目录 + 注入桩，注册表/进程/网络调用均被替换，未声明的
+系统写入即测试失败）；`test_mcp_server` 会真实拉起本仓库的 MCP 服务器做
+协议冒烟（只读诊断 + 指引语义断言）。
 
 ## 许可
 

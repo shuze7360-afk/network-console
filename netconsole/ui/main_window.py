@@ -1,9 +1,11 @@
-"""网络控制台主窗口与托盘（通用版）。
+"""网络控制台主窗口与托盘（通用版 2.0.0）。
 
 四张功能卡：基础网络 / 网络认证 / 代理连接 / 本地服务。
-规则：界面不直接修改系统设置（写入一律经执行器审计）；未配置的功能显示
-「未配置」并禁用管理按钮；启停是异步操作，完成与否以核验结果为准。
-isolated=True 供视觉测试：不启动定时器/真实检查/持久化。
+规则：界面不直接修改系统设置（写入一律经执行器审计）；**后台零网络修改**——
+自动清理已废除，发现问题只提醒，修复由用户点击。所有修改入口显式传
+source="ui"（执行器来源闸门：后台来源一律 manual-required）。
+未配置的功能显示「未配置」并禁用管理按钮；启停是异步操作，完成与否以核验
+结果为准。isolated=True 供视觉测试：不启动定时器/真实检查/持久化。
 关闭窗口 = 缩到托盘；退出 = 停止常驻监测，不等于关闭任何服务。
 """
 from __future__ import annotations
@@ -33,6 +35,20 @@ from netconsole.models import AUTH, BASIC, LINK_ORDER, LINK_TITLES, PROXY, SERVI
 from netconsole.notify_policy import NotifyPolicy
 from . import theme
 from .widgets import FlowLayout
+
+APP_USER_MODEL_ID = "NetworkConsole.App.1"
+
+
+def ensure_app_user_model_id() -> None:
+    """进程级 AppUserModelID：任务栏/固定项据此关联应用图标（须在创建窗口前调用）。"""
+    if sys.platform == "win32":
+        try:
+            import ctypes
+
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_USER_MODEL_ID)
+        except Exception:
+            pass
+
 
 SWITCH_TEXTS = {
     AUTH: ("关闭网络认证管理", "开启网络认证管理"),
@@ -278,6 +294,7 @@ class MainWindow(QMainWindow):
     def __init__(self, isolated: bool = False) -> None:
         super().__init__()
         self.isolated = isolated
+        ensure_app_user_model_id()
         self.setWindowTitle("网络控制台")
         self.resize(960, 700)
         self._thread: CollectThread | None = None
@@ -515,7 +532,7 @@ class MainWindow(QMainWindow):
         self.refresh_btn.setEnabled(True)
         self.status.setText(f"上次检查 {ts}。自动复查间隔 3 分钟。")
         self.log.info("check done source=%s", self._collect_source)
-        # 摘要始终展示；策略/通知/自动清理仅在真实（非隔离）且未过代际时执行
+        # 摘要始终展示；通知策略仅在真实（非隔离）且未过代际时执行
         summ = present.summarize(snap)
         self._apply_summary(summ)
         stale = self.isolated or self._collect_gen != self._generation
@@ -531,11 +548,8 @@ class MainWindow(QMainWindow):
                        + "\n".join(f"· {n['title']}：{n['message']}" for n in ns))
                 self.tray.showMessage("网络控制台", msg,
                                       QSystemTrayIcon.MessageIcon.Warning, 8000)
-            daily = snap.get("links", {}).get(PROXY, {})
-            if (daily.get("status") == "故障" and daily.get("kind") == "stale_residue"
-                    and self.policy.allow_autofix(PROXY)):
-                QTimer.singleShot(300, lambda: self._run_fix(
-                    self.executor.cleanup_stale_proxy, "自动清理代理残留"))
+            # 后台零修改（2.0.0）：发现的残留只提醒，不自动清理——
+            # 修复由用户在「代理连接」卡片点击「清理残留代理」。
 
     def _apply_summary(self, summ: dict) -> None:
         t = theme.theme_manager.tokens()
@@ -598,9 +612,7 @@ class MainWindow(QMainWindow):
         text = f"{label}：{fb['state']}（{decision}）{('；' + reason) if reason else ''} · {fb['verify']}"
         self.status.setText(text)
         self.log.info("fix done label=%s ok=%s decision=%s", label, ok, decision)
-        if label.startswith("自动") and card_link:
-            self.policy.note_autofix(card_link, ok, decision, reason)
-        elif card_link:
+        if card_link:
             card = self.cards.get(card_link)
             if card is not None and not ok and fb["steps"]:
                 card.set_op_result(f"上次操作：未完成 · {reason}",
@@ -646,9 +658,11 @@ class MainWindow(QMainWindow):
         elif action_id == present.ACTION_SHOW_DETAILS:
             self._toggle_findings()
         elif action_id == "cleanup_stale_proxy":
-            self._run_fix(self.executor.cleanup_stale_proxy, "清理代理残留", PROXY)
+            self._run_fix(lambda: self.executor.cleanup_stale_proxy(source="ui"),
+                          "清理代理残留", PROXY)
         elif action_id == "restore_bypass":
-            self._run_fix(self.executor.restore_bypass, "恢复直连例外", PROXY)
+            self._run_fix(lambda: self.executor.restore_bypass(source="ui"),
+                          "恢复直连例外", PROXY)
 
     def _toggle_feature(self, link: str) -> None:
         if self.isolated or self.executor is None:
@@ -673,7 +687,7 @@ class MainWindow(QMainWindow):
         self.cards[link].set_transition("开启中" if target_on else "关闭中")
         self.status.setText(f"正在{'开启' if target_on else '关闭'}{LINK_TITLES[link]}…")
         fn = self.executor.feature_enable if target_on else self.executor.feature_disable
-        self._fix_thread = FnThread(lambda: fn(link))
+        self._fix_thread = FnThread(lambda: fn(link, source="ui"))
         self._fix_thread.done.connect(lambda res, l=link, on=target_on:
                                       self._toggle_done(l, on, res))
         self._fix_thread.start()
@@ -704,7 +718,7 @@ class MainWindow(QMainWindow):
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.Yes)
         if confirm == QMessageBox.StandardButton.Yes:
-            self._run_fix(self.executor.restore_snapshot, "恢复上次配置")
+            self._run_fix(lambda: self.executor.restore_snapshot(source="ui"), "恢复上次配置")
 
     # ---- 工具 ----
     def export_report(self) -> None:
