@@ -88,7 +88,7 @@ def main() -> int:
     case("PA11 probe_endpoints：全部端点逐一探测、可注入、非法 False", lambda:
          proxyaddr.probe_endpoints("http=127.0.0.1:8080;https=127.0.0.1:8080",
                                    lambda h, p: True) is True
-         and proxyaddr.probe_endpoints("http=127.0.0.1:8080;https=127.0.0.2:8080",
+         and proxyaddr.probe_endpoints("http=127.0.0.1:8080;https=192.0.2.11:8080",
                                        lambda h, p: h == "127.0.0.1") is False
          and proxyaddr.probe_endpoints("garbage", lambda h, p: True) is False
          and proxyaddr.probe_endpoints("", lambda h, p: True) is False)

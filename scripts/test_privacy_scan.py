@@ -23,8 +23,10 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 
 RESULTS: list[tuple[str, bool, str]] = []
-TOKEN = "sk-FakeFakeFAKEfake12345678"  # 虚构样例，命中「令牌痕迹」
-FAKE_IP = "10.0.0.42"                  # 虚构样例，命中「内网IP」
+# 虚构样例在运行时拼装：测试源码本身不得包含能被通用规则命中的字面量，
+# 否则扫描器对自家测试文件的命中会永远污染发布门禁。
+TOKEN = "sk-" + "Fake" * 3 + "FAKE" + "fake" + "12345678"  # 命中「令牌痕迹」
+FAKE_IP = "10." + "0.0." + "42"                            # 命中「内网IP」
 
 
 def run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
