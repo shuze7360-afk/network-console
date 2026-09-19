@@ -1,0 +1,35 @@
+{
+  "features": {
+    "basic": {
+      "enabled": true,
+      "probe_url": "http://www.msftconnecttest.com/connecttest.txt",
+      "ok_status": 200
+    },
+    "auth": {
+      "enabled": false,
+      "title": "网络认证",
+      "login_url": "https://portal.example.edu/login",
+      "match_prefixes": ["CAMPUS"],
+      "hosts_expect": { "portal.example.edu": "192.0.2.10" }
+    },
+    "proxy": {
+      "enabled": false,
+      "title": "代理连接",
+      "endpoint": "127.0.0.1:8080",
+      "probe_url": "http://www.msftconnecttest.com/connecttest.txt",
+      "ok_status": 200,
+      "program": { "path": "C:\\Path\\To\\proxy.exe", "args": [], "workdir": "" }
+    },
+    "service": {
+      "enabled": false,
+      "title": "本地服务",
+      "endpoint": "127.0.0.1:9000",
+      "health_path": "/health",
+      "program": { "path": "C:\\Path\\To\\service.exe", "args": [], "workdir": "" }
+    }
+  },
+  "cleanup": {
+    "controlled_endpoint": "127.0.0.1:8080",
+    "bypass_defaults": ["localhost", "127.0.0.1", "<local>"]
+  }
+}

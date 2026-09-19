@@ -1,0 +1,30 @@
+# 运行数据与状态（绝不提交）
+*.log
+*.jsonl
+*.tmp
+config.json
+wininet-*.json
+settings-backup/
+residue-backup/
+logs/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 构建与打包产物
+dist/
+build/
+*.spec
+
+# 截图（由脚本重新生成，也可选择性提交）
+reports/
+
+# 本地工具
+scripts/_local/
+
+# 意外生成的目录
+%TEMP%/
+reports/visual/
